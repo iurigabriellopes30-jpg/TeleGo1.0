@@ -1,5 +1,6 @@
 
 export enum DeliveryStatus {
+  CREATED = 'CREATED',
   PENDING = 'PENDING',
   ACCEPTED = 'ACCEPTED',
   PICKED_UP = 'PICKED_UP',
@@ -32,6 +33,7 @@ export interface ChatMessage {
 
 export interface User {
   id: string;
+  roleSpecificId?: string;
   name: string;
   email: string;
   role: UserRole;

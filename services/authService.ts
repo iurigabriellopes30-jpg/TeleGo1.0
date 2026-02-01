@@ -9,7 +9,7 @@ export const authService = {
       password,
       options: {
         data: {
-          name,
+          full_name: name,
           role
         }
       }
@@ -37,18 +37,28 @@ export const authService = {
     if (profileError) throw profileError;
 
     if (!profile.approved) {
-      // Se não aprovado, faz sign out imediatamente
       await supabase.auth.signOut();
       throw new Error('Conta pendente de aprovação pelo administrador.');
+    }
+
+    // Buscar ID específico da role
+    let roleSpecificId = profile.id;
+    if (profile.role === UserRole.RESTAURANT) {
+      const { data: rest } = await supabase.from('restaurants').select('id').eq('profile_id', profile.id).single();
+      if (rest) roleSpecificId = rest.id;
+    } else if (profile.role === UserRole.COURIER) {
+      const { data: cour } = await supabase.from('couriers').select('id').eq('profile_id', profile.id).single();
+      if (cour) roleSpecificId = cour.id;
     }
 
     return {
       user: {
         id: profile.id,
-        name: profile.name,
+        roleSpecificId: roleSpecificId, // Novo campo para facilitar FKs
+        name: profile.full_name || profile.name,
         email: profile.email,
         role: profile.role as UserRole,
-        avatar: profile.avatar,
+        avatar: profile.avatar_url,
         createdAt: new Date(profile.created_at).getTime(),
         approved: profile.approved
       },
@@ -60,9 +70,8 @@ export const authService = {
     const { data: updatedProfile, error } = await supabase
       .from('profiles')
       .update({
-        name: data.name,
-        avatar: data.avatar,
-        // email não é alterado aqui geralmente no Supabase Auth sem fluxo de confirmação
+        full_name: data.name,
+        avatar_url: data.avatar,
       })
       .eq('id', userId)
       .select()
@@ -72,26 +81,21 @@ export const authService = {
 
     return {
       id: updatedProfile.id,
-      name: updatedProfile.name,
+      name: updatedProfile.full_name,
       email: updatedProfile.email,
       role: updatedProfile.role as UserRole,
-      avatar: updatedProfile.avatar,
+      avatar: updatedProfile.avatar_url,
       createdAt: new Date(updatedProfile.created_at).getTime(),
       approved: updatedProfile.approved
     };
   },
 
   changePassword: async (userId: string, currentPass: string, newPass: string): Promise<void> => {
-    // Nota: O Supabase Auth geralmente requer que o usuário esteja logado
-    // ou use um fluxo de reset. Aqui simplificamos usando updatePassword.
     const { error } = await supabase.auth.updateUser({
       password: newPass
     });
-
     if (error) throw error;
   },
-
-  // --- Funções Administrativas ---
 
   getAllUsers: async (): Promise<User[]> => {
     const { data, error } = await supabase
@@ -103,10 +107,10 @@ export const authService = {
 
     return data.map(p => ({
       id: p.id,
-      name: p.name,
+      name: p.full_name,
       email: p.email,
       role: p.role as UserRole,
-      avatar: p.avatar,
+      avatar: p.avatar_url,
       createdAt: new Date(p.created_at).getTime(),
       approved: p.approved
     }));
@@ -122,9 +126,6 @@ export const authService = {
   },
 
   deleteUser: async (userId: string): Promise<void> => {
-    // Nota: Deletar o perfil na tabela pública é Cascade se configurado no SQL,
-    // mas deletar do Auth requer privilégios de Admin (Service Role) que não
-    // devem estar no frontend. Geralmente o Admin desativa ou o perfil é removido.
     const { error } = await supabase
       .from('profiles')
       .delete()

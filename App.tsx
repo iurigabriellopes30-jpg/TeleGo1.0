@@ -20,11 +20,9 @@ const App: React.FC = () => {
   // Inicialização e Recuperação de Sessão
   useEffect(() => {
     const initApp = async () => {
-      // 1. Verificar sessão ativa do Supabase
       const { data: { session: sbSession } } = await supabase.auth.getSession();
 
       if (sbSession?.user) {
-        // Buscar perfil completo
         const { data: profile } = await supabase
           .from('profiles')
           .select('*')
@@ -32,13 +30,23 @@ const App: React.FC = () => {
           .single();
 
         if (profile && profile.approved) {
+           let roleSpecificId = profile.id;
+           if (profile.role === UserRole.RESTAURANT) {
+             const { data: rest } = await supabase.from('restaurants').select('id').eq('profile_id', profile.id).single();
+             if (rest) roleSpecificId = rest.id;
+           } else if (profile.role === UserRole.COURIER) {
+             const { data: cour } = await supabase.from('couriers').select('id').eq('profile_id', profile.id).single();
+             if (cour) roleSpecificId = cour.id;
+           }
+
           setSession({
             user: {
               id: profile.id,
-              name: profile.name,
+              roleSpecificId,
+              name: profile.full_name || profile.name,
               email: profile.email,
               role: profile.role as UserRole,
-              avatar: profile.avatar,
+              avatar: profile.avatar_url,
               createdAt: new Date(profile.created_at).getTime(),
               approved: profile.approved
             },
@@ -47,23 +55,23 @@ const App: React.FC = () => {
         }
       }
 
-      // 2. Carregar entregas iniciais
       const { data: initialDeliveries } = await supabase
         .from('deliveries')
-        .select('*, chat_messages(*)')
+        .select('*, chat_messages(*), restaurant:restaurants(business_name)')
         .order('created_at', { ascending: false });
 
       if (initialDeliveries) {
         setDeliveries(initialDeliveries.map(d => ({
           ...d,
           restaurantId: d.restaurant_id,
-          restaurantName: d.restaurant_name,
+          restaurantName: d.restaurant?.business_name || 'Restaurante',
           customerName: d.customer_name,
           customerPhone: d.customer_phone,
           pickupAddress: d.pickup_address,
           deliveryAddress: d.delivery_address,
           orderValue: d.order_value,
-          isPaid: d.is_paid,
+          price: d.delivery_fee, // Mapeamento correto
+          isPaid: d.is_paid_to_restaurant,
           courierId: d.courier_id,
           createdAt: new Date(d.created_at).getTime(),
           messages: d.chat_messages?.map((m: any) => ({
@@ -81,7 +89,7 @@ const App: React.FC = () => {
     initApp();
   }, []);
 
-  // Realtime Subscriptions (Substitui o Polling)
+  // Realtime Subscriptions
   useEffect(() => {
     const channel = supabase
       .channel('schema-db-changes')
@@ -89,20 +97,21 @@ const App: React.FC = () => {
         'postgres_changes',
         { event: '*', schema: 'public', table: 'deliveries' },
         async (payload) => {
-          console.log('Change received!', payload);
-
           if (payload.eventType === 'INSERT') {
             const d = payload.new as any;
+            // Fetch restaurant name for UI
+            const { data: rest } = await supabase.from('restaurants').select('business_name').eq('id', d.restaurant_id).single();
             setDeliveries(prev => [{
               ...d,
               restaurantId: d.restaurant_id,
-              restaurantName: d.restaurant_name,
+              restaurantName: rest?.business_name || 'Restaurante',
               customerName: d.customer_name,
               customerPhone: d.customer_phone,
               pickupAddress: d.pickup_address,
               deliveryAddress: d.delivery_address,
               orderValue: d.order_value,
-              isPaid: d.is_paid,
+              price: d.delivery_fee,
+              isPaid: d.is_paid_to_restaurant,
               courierId: d.courier_id,
               createdAt: new Date(d.created_at).getTime(),
               messages: []
@@ -113,13 +122,13 @@ const App: React.FC = () => {
               ...old,
               ...d,
               restaurantId: d.restaurant_id,
-              restaurantName: d.restaurant_name,
               customerName: d.customer_name,
               customerPhone: d.customer_phone,
               pickupAddress: d.pickup_address,
               deliveryAddress: d.delivery_address,
               orderValue: d.order_value,
-              isPaid: d.is_paid,
+              price: d.delivery_fee,
+              isPaid: d.is_paid_to_restaurant,
               courierId: d.courier_id,
               createdAt: new Date(d.created_at).getTime()
             } : old));
@@ -137,8 +146,8 @@ const App: React.FC = () => {
             ...d,
             messages: [...(d.messages || []), {
               ...newMsg,
-            senderId: newMsg.sender_id,
-            senderName: newMsg.sender_name,
+              senderId: newMsg.sender_id,
+              senderName: newMsg.sender_name,
               timestamp: new Date(newMsg.created_at).getTime()
             }]
           } : d));
@@ -156,33 +165,37 @@ const App: React.FC = () => {
   }, []);
 
   const addDelivery = useCallback(async (newDelivery: Omit<Delivery, 'id' | 'createdAt' | 'status' | 'restaurantId' | 'restaurantName' | 'messages'>) => {
-    if (!session) return;
+    if (!session || !session.user.roleSpecificId) return;
 
     const { error } = await supabase
       .from('deliveries')
       .insert({
-        restaurant_id: session.user.id,
-        restaurant_name: session.user.name,
+        restaurant_id: session.user.roleSpecificId,
         customer_name: newDelivery.customerName,
         customer_phone: newDelivery.customerPhone,
         pickup_address: newDelivery.pickupAddress,
         delivery_address: newDelivery.deliveryAddress,
-        price: newDelivery.price,
+        delivery_fee: newDelivery.price,
         order_value: newDelivery.orderValue,
-        is_paid: newDelivery.isPaid,
-        observations: newDelivery.observations,
-        status: DeliveryStatus.PENDING
+        is_paid_to_restaurant: newDelivery.isPaid,
+        delivery_details: newDelivery.observations,
+        status: DeliveryStatus.CREATED
       });
 
     if (error) {
       console.error('Erro ao adicionar entrega:', error);
-      alert('Erro ao criar pedido.');
+      alert('Erro ao criar pedido: ' + error.message);
     }
   }, [session]);
 
   const updateDeliveryStatus = useCallback(async (id: string, status: DeliveryStatus, courierId?: string) => {
     const updateData: any = { status };
-    if (courierId) updateData.courier_id = courierId;
+    if (courierId) {
+       // Buscar ID do motoboy se for passado o profileId
+       const { data: cour } = await supabase.from('couriers').select('id').eq('profile_id', courierId).single();
+       if (cour) updateData.courier_id = cour.id;
+       else updateData.courier_id = courierId; // fallback
+    }
 
     const { error } = await supabase
       .from('deliveries')
@@ -193,19 +206,18 @@ const App: React.FC = () => {
   }, []);
 
   const refuseDelivery = useCallback(async (deliveryId: string, courierId: string) => {
-    // Buscar recusados atuais
-    const delivery = deliveries.find(d => d.id === deliveryId);
-    const currentRefused = (delivery as any).refused_by || [];
+    // Na lógica sequential, a recusa deve atualizar a delivery_offers
+    const { data: cour } = await supabase.from('couriers').select('id').eq('profile_id', courierId).single();
+    if (!cour) return;
 
     const { error } = await supabase
-      .from('deliveries')
-      .update({
-        refused_by: [...currentRefused, courierId]
-      })
-      .eq('id', deliveryId);
+      .from('delivery_offers')
+      .update({ status: 'REJECTED' })
+      .eq('delivery_id', deliveryId)
+      .eq('courier_id', cour.id);
 
     if (error) console.error('Erro ao recusar entrega:', error);
-  }, [deliveries]);
+  }, []);
 
   const handleSendMessage = useCallback(async (deliveryId: string, text: string) => {
     if (!session) return;
@@ -215,8 +227,7 @@ const App: React.FC = () => {
       .insert({
         delivery_id: deliveryId,
         sender_id: session.user.id,
-        sender_name: session.user.name,
-        text
+        content: text
       });
 
     if (error) console.error('Erro ao enviar mensagem:', error);
@@ -244,7 +255,7 @@ const App: React.FC = () => {
     if (session.user.role === UserRole.RESTAURANT) {
       return (
         <RestaurantDashboard
-          deliveries={deliveries.filter(d => (d as any).restaurant_id === session.user.id || d.restaurantId === session.user.id)}
+          deliveries={deliveries.filter(d => (d as any).restaurant_id === session.user.roleSpecificId)}
           onAddDelivery={addDelivery}
           userName={session.user.name}
           currentUserId={session.user.id}
@@ -272,7 +283,7 @@ const App: React.FC = () => {
         if (session.user.role === UserRole.ADMIN) {
            return <AdminActivityScreen deliveries={deliveries} />;
         }
-        return <HistoryScreen role={session.user.role} deliveries={deliveries} currentUserId={session.user.id} />;
+        return <HistoryScreen role={session.user.role} deliveries={deliveries} currentUserId={session.user.roleSpecificId || session.user.id} />;
       case AppTab.PROFILE:
         return (
           <ProfileScreen
@@ -280,8 +291,8 @@ const App: React.FC = () => {
             onLogout={handleLogout}
             onUpdateUser={handleUpdateUser}
             stats={{
-              total: deliveries.filter(d => (session.user.role === UserRole.RESTAURANT ? ((d as any).restaurant_id === session.user.id) : ((d as any).courier_id === session.user.id))).length,
-              delivered: deliveries.filter(d => (session.user.role === UserRole.RESTAURANT ? ((d as any).restaurant_id === session.user.id) : ((d as any).courier_id === session.user.id)) && d.status === DeliveryStatus.DELIVERED).length
+              total: deliveries.filter(d => (session.user.role === UserRole.RESTAURANT ? ((d as any).restaurant_id === session.user.roleSpecificId) : ((d as any).courier_id === session.user.roleSpecificId))).length,
+              delivered: deliveries.filter(d => (session.user.role === UserRole.RESTAURANT ? ((d as any).restaurant_id === session.user.roleSpecificId) : ((d as any).courier_id === session.user.roleSpecificId)) && d.status === DeliveryStatus.DELIVERED).length
             }}
           />
         );
